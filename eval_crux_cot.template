@@ -1,0 +1,332 @@
+#!/bin/bash
+
+#SBATCH -p interactive
+#SBATCH -A llmservice_fm_text
+#SBATCH -t 4:00:00
+#SBATCH --nodes=1
+#SBATCH --exclusive
+#SBATCH --mem=0
+#SBATCH --overcommit
+#SBATCH --gpus-per-node=8
+#SBATCH --ntasks-per-node=2
+#SBATCH --job-name=eval_crux:@EXPERIMENT_SHORT@
+
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export NVTE_FWD_LAYERNORM_SM_MARGIN=16
+export NVTE_BWD_LAYERNORM_SM_MARGIN=16
+export NCCL_BLOCKING_WAIT=0
+
+IMAGE_PATH="/lustre/fsw/portfolios/llmservice/users/chengyud/images/adlr+megatron-lm+pytorch+24.01v3-py3-train-inf.sqsh"
+
+CHECKPOINT_STEP="@CKPT@"
+MODEL_NAME="@EXPERIMENT@"
+TRIMMED_MODEL_NAME="@EXPERIMENT_SHORT@"
+
+# CHECKPOINT_STEP="150472"
+CHECKPOINT_STEP="158945"
+MODEL_NAME="data-quality-7b-code-1T-mixing-1"
+TRIMMED_MODEL_NAME=${MODEL_NAME}
+
+# MODEL_GROUP="hp_config"
+MODEL_GROUP="pretraining"
+MODEL_CHECKPOINT_DIR="/lustre/fsw/portfolios/llmservice/users/chengyud/runs/${MODEL_GROUP}/${MODEL_NAME}/checkpoints"
+OUTPUT_ROOT="/lustre/fsw/portfolios/llmservice/users/chengyud/experiments_evaluation/code_evaluation"
+# LM_EVAL_HARNESS_PATH="/lustre/fsw/portfolios/llmservice/users/chengyud/lm-evaluation-harness"
+# LIVEBENCH_PATH="/lustre/fsw/portfolios/llmservice/users/chengyud/experiments_evaluation/LiveBench"
+EVAL_CODE_DIR="/lustre/fsw/portfolios/llmservice/users/chengyud/eval-code"
+TOKENIZER_MODEL="/lustre/fsw/portfolios/llmservice/users/chengyud/tokenizers/multiMixV5_fix_default_500000_128k.vocab.json"
+
+## Need to modify "latest_checkpointed_iteration.txt" to be able to load a custom checkpoint, ckpt_step is not working
+# if [ ! -z ${CHECKPOINT_STEP} ]; then
+#     options="${options} --ckpt-step ${CHECKPOINT_STEP}"
+# fi
+if [ ! -z ${CHECKPOINT_STEP} ]; then
+    # chmod -R +w ${MODEL_CHECKPOINT_DIR}
+    PADDED_CHECKPOINT_STEP=$(printf "%07d" ${CHECKPOINT_STEP})
+    ORIG_MODEL_CHECKPOINT_DIR="/lustre/fsw/portfolios/llmservice/users/chengyud/runs/${MODEL_GROUP}/${MODEL_NAME}/checkpoints"
+    MODEL_CHECKPOINT_DIR="/lustre/fsw/portfolios/llmservice/users/chengyud/runs/${MODEL_GROUP}/eval_tmp/${MODEL_NAME}/iter_${PADDED_CHECKPOINT_STEP}/checkpoints"
+    mkdir -p $MODEL_CHECKPOINT_DIR
+
+    # cp ${MODEL_CHECKPOINT_DIR}/latest_checkpointed_iteration.txt ${MODEL_CHECKPOINT_DIR}/latest_checkpointed_iteration_backup.txt
+    echo ${CHECKPOINT_STEP} > ${MODEL_CHECKPOINT_DIR}/latest_checkpointed_iteration.txt
+    ln -s ${ORIG_MODEL_CHECKPOINT_DIR}/iter_${PADDED_CHECKPOINT_STEP} ${MODEL_CHECKPOINT_DIR}/
+    # chmod -R -w ${MODEL_CHECKPOINT_DIR}
+fi
+
+########################################################
+#### CHANGES SHOULD NOT BE NEEDED BEYOND THIS POINT ####
+########################################################
+
+DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
+
+if [ -n "${SLURM_JOB_ID:-}" ] ; then
+    SCRIPT_PATH=$(scontrol show job "$SLURM_JOB_ID" | awk -F= '/Command=/{print $2}')
+    ENV_LOG_FILENAME=${TRIMMED_MODEL_NAME}_${SLURM_JOB_ID}_${DATETIME}.env.log
+else
+    SCRIPT_PATH=$(realpath "$0")
+    ENV_LOG_FILENAME=${TRIMMED_MODEL_NAME}_${DATETIME}.env.log
+fi
+
+RUN_DIR="${OUTPUT_ROOT}/runs/${MODEL_NAME}"
+if [ ! -z ${CHECKPOINT_STEP} ]; then
+    PADDED_CHECKPOINT_STEP=$(printf "%07d" ${CHECKPOINT_STEP})
+    RUN_DIR="${RUN_DIR}/iter_${PADDED_CHECKPOINT_STEP}"
+fi
+# CHECKPOINT_DIR="${RUN_DIR}/checkpoints"
+CHECKPOINT_DIR="${MODEL_CHECKPOINT_DIR}"
+DATACACHE_DIR="${RUN_DIR}/data-cache"
+LOGS_DIR="${RUN_DIR}/eval-logs"
+EVAL_DIR="${RUN_DIR}/eval-results"
+TENSORBOARD_DIR="${RUN_DIR}/tensorboard"
+
+mkdir -p "${LOGS_DIR}" "${EVAL_DIR}"
+
+################################################################
+### Log environment
+################################################################
+echo "<< START PATHS >>" |& tee -a ${LOGS_DIR}/${ENV_LOG_FILENAME}
+echo "IMAGE_PATH=${IMAGE_PATH}" |& tee -a ${LOGS_DIR}/${ENV_LOG_FILENAME}
+echo "OUTPUT_ROOT=${OUTPUT_ROOT}" |& tee -a ${LOGS_DIR}/${ENV_LOG_FILENAME}
+echo "SCRIPT_DIR=${SCRIPT_DIR}" |& tee -a ${LOGS_DIR}/${ENV_LOG_FILENAME}
+echo "EVAL_CODE_DIR=${EVAL_CODE_DIR}" |& tee -a ${LOGS_DIR}/${ENV_LOG_FILENAME}
+echo "RUN_DIR=${RUN_DIR}" |& tee -a ${LOGS_DIR}/${ENV_LOG_FILENAME}
+echo "LOGS_DIR=${LOGS_DIR}" |& tee -a ${LOGS_DIR}/${ENV_LOG_FILENAME}
+echo "CHECKPOINT_DIR=${CHECKPOINT_DIR}" |& tee -a ${LOGS_DIR}/${ENV_LOG_FILENAME}
+echo "DATACACHE_DIR=${DATACACHE_DIR}" |& tee -a ${LOGS_DIR}/${ENV_LOG_FILENAME}
+echo "TENSORBOARD_DIR=${TENSORBOARD_DIR}" |& tee -a ${LOGS_DIR}/${ENV_LOG_FILENAME}
+echo "SCRIPT_DIR=${SCRIPT_DIR}" |& tee -a ${LOGS_DIR}/${ENV_LOG_FILENAME}
+echo "EVAL_CODE_DIR=${EVAL_CODE_DIR}" |& tee -a ${LOGS_DIR}/${ENV_LOG_FILENAME}
+echo "<< END PATHS >>" |& tee -a ${LOGS_DIR}/${ENV_LOG_FILENAME}
+echo -e "\n\n" |& tee -a ${LOGS_DIR}/${ENV_LOG_FILENAME}
+
+echo "<< START GIT >>" |& tee -a ${LOGS_DIR}/${ENV_LOG_FILENAME}
+echo "GIT LOG" |& tee -a ${LOGS_DIR}/${ENV_LOG_FILENAME}
+git -C ${EVAL_CODE_DIR} log --oneline -1 |& tee -a ${LOGS_DIR}/${ENV_LOG_FILENAME}
+echo -e "\n\n" |& tee -a ${LOGS_DIR}/${ENV_LOG_FILENAME}
+echo "GIT STATUS" |& tee -a ${LOGS_DIR}/${ENV_LOG_FILENAME}
+git -C ${EVAL_CODE_DIR} status --porcelain --branch |& tee -a ${LOGS_DIR}/${ENV_LOG_FILENAME}
+echo -e "\n\n" |& tee -a ${LOGS_DIR}/${ENV_LOG_FILENAME}
+echo "GIT DIFF" |& tee -a ${LOGS_DIR}/${ENV_LOG_FILENAME}
+git -C ${EVAL_CODE_DIR} diff |& tee -a ${LOGS_DIR}/${ENV_LOG_FILENAME}
+echo "<< END GIT >>" |& tee -a ${LOGS_DIR}/${ENV_LOG_FILENAME}
+echo -e "\n\n" |& tee -a ${LOGS_DIR}/${ENV_LOG_FILENAME}
+
+echo "<< START ENV >>" |& tee -a ${LOGS_DIR}/${ENV_LOG_FILENAME}
+env |& tee -a ${LOGS_DIR}/${ENV_LOG_FILENAME}
+echo "<< END ENV >>" |& tee -a ${LOGS_DIR}/${ENV_LOG_FILENAME}
+
+
+TIKTOKEN_PATTERN=v1
+
+# Copy scripts.
+mkdir -p ${RUN_DIR}/scripts
+cp ${SCRIPT_PATH} ${RUN_DIR}/scripts
+
+export NCCL_ALGO=^NVLS
+
+BATCH_SIZE_PER_INSTANCE=32
+MAX_TOKENS_TO_OOM=256000  # 64000 
+options=" \
+    --max-tokens-to-oom ${MAX_TOKENS_TO_OOM} \
+    --distributed-timeout-minutes 60 \
+    --use-mcore-models \
+    --data-cache-path ${DATACACHE_DIR} \
+    --untie-embeddings-and-output-weights \
+    --disable-bias-linear \
+    --position-embedding-type rope \
+    --rotary-base 1000000 \
+    --rotary-percent 1.0 \
+    --swiglu \
+    --normalization RMSNorm \
+    --attention-dropout 0.0 \
+    --hidden-dropout 0.0 \
+    --exit-duration-in-mins 230 \
+    --tensor-model-parallel-size 2 \
+    --pipeline-model-parallel-size 1 \
+    --num-layers 32 \
+    --hidden-size 4096 \
+    --ffn-hidden-size 14336 \
+    --num-attention-heads 32 \
+    --kv-channels 128 \
+    --group-query-attention \
+    --num-query-groups 8 \
+    --seq-length 4096 \
+    --max-position-embeddings 4096 \
+    --micro-batch-size ${BATCH_SIZE_PER_INSTANCE} \
+    --global-batch-size 1536 \
+    --train-samples 73242187 \
+    --lr-decay-samples 73242187 \
+    --valid-data-path 1.0 /lustre/fsw/portfolios/llmservice/users/bnorick/data/binidx/val/val \
+    --test-data-path 1.0 /lustre/fsw/portfolios/llmservice/users/bnorick/data/binidx/val/val \
+    --lr 4.5e-5 \
+    --min-lr 4.5e-7 \
+    --lr-decay-style cosine \
+    --log-interval 100 \
+    --eval-iters 32 \
+    --eval-interval 2000 \
+    --tokenizer-type TikTokenizer \
+    --tokenizer-model ${TOKENIZER_MODEL} \
+    --tiktoken-pattern ${TIKTOKEN_PATTERN} \
+    --load ${CHECKPOINT_DIR} \
+    --save ${CHECKPOINT_DIR} \
+    --save-interval 4000 \
+    --split 99,1,0 \
+    --clip-grad 1.0 \
+    --weight-decay 0.1 \
+    --adam-beta1 0.9 \
+    --adam-beta2 0.95 \
+    --init-method-std 0.0134 \
+    --log-params-norm \
+    --log-num-zeros-in-grad \
+    --log-throughput \
+    --use-distributed-optimizer \
+    --manual-gc \
+    --num-workers 1 \
+    --tensorboard-dir ${TENSORBOARD_DIR}"
+
+
+#    --bf16 \  ## Chengyu: use fp32 for code evaluation to reduce the variance
+run_cmd="python -u ${EVAL_CODE_DIR}/tools/run_text_generation_server.py ${options}"
+
+# Start the server
+LOG_FILE="${LOGS_DIR}/${SLURM_JOB_NAME}_${SLURM_JOB_ID}_${DATETIME}.log"
+echo "[$(date)] Starting the inference server"  |& tee -a ${LOG_FILE}
+srun --output=${LOG_FILE} --export=ALL -l \
+    --container-image ${IMAGE_PATH} \
+    --container-mounts "/home:/home,/lustre:/lustre" \
+    --no-container-mount-home \
+    sh -c "pip install boto3 flask flask-restful tiktoken && cd ${DIR} && ${run_cmd}" &
+INFER_PID=$!
+echo "Inference server started with PID: ${INFER_PID}" |& tee -a ${LOG_FILE}
+
+echo "Waiting for the inference server to initialize..." |& tee -a ${LOG_FILE}
+sleep 120
+
+
+# Make sure the server is running
+# Otherwise lcb might fail silently
+check_server() {
+  tail -n 2 ${LOG_FILE} | grep -q "Running on http://.*:5000"
+}
+
+while true; do
+  if check_server; then
+    echo "Server is running." |& tee -a ${LOG_FILE}
+    break
+  else
+    echo "Server not yet running. Waiting for 120 seconds..." |& tee -a ${LOG_FILE}
+    sleep 120
+  fi
+done
+
+echo "Server log path:"
+echo ${LOG_FILE}
+echo -e "\nLast 5 lines:"
+tail -n 5 ${LOG_FILE}
+echo -e "\nCheckpoint loading line:"
+cat ${LOG_FILE} | grep "loading checkpoint from"
+LOADED_CKPT_STEP=$(cat ${LOG_FILE} | grep "loading checkpoint from" | grep -oP 'iteration \K\d+')
+if [[ "${LOADED_CKPT_STEP}" -ne "${CHECKPOINT_STEP}" ]]; then
+  echo "ERROR: Checkpoint loading failed. Expected: ${CHECKPOINT_STEP}, Loaded: ${LOADED_CKPT_STEP}" |& tee -a ${LOG_FILE}
+  exit 1
+fi
+echo -e "\n\n"
+
+
+# --------------------------- Run the generation ---------------------------
+echo
+MEGATRON_IP=127.0.0.1
+OUTPUT_PATH=${EVAL_DIR} 
+source /lustre/fsw/portfolios/llmservice/users/chengyud/miniconda3/bin/activate cruxeval
+# export HF_ALLOW_CODE_EVAL=1
+
+# echo "[$(date)] Running all code benchmarks"
+export HF_HOME="/lustre/fsw/portfolios/llmservice/users/chengyud/huggingface"
+export HF_DATASETS_CACHE="/lustre/fsw/portfolios/llmservice/users/chengyud/huggingface/datasets"
+export HF_HUB_CACHE="/lustre/fsw/portfolios/llmservice/users/chengyud/huggingface/hub"
+export XDG_CACHE_HOME="/lustre/fs1/portfolios/llmservice/users/chengyud/experiments_evaluation/bigcodebench/.cache"  # for `from appdirs import user_cache_dir` in `data.utils`
+# export HOME="/lustre/fsw/portfolios/llmservice/users/chengyud"
+# cannot set export HOME="", otherwise conda env doesn't work, not sure why
+
+BENCH_TYPES=("input" "output")
+MODEL_PREFIX="megatron"
+BATCH_SIZE=4  # 8 causes oom  # The server-side batch size will be batch_size * n_samples
+DO_COT=true
+if [[ "${DO_COT}" == "true" ]]; then
+  MAX_NEW_TOKENS=640  # 1280
+else
+  MAX_NEW_TOKENS=64  # 128  # Need some tests, 10 is too small
+fi
+GREEDY=false  # true
+N_SAMPLES=10  # number of trials in generation, should be 1 if greedy decoding
+TEMPERATURE=0.2  # 1.0  # not used if greedy
+base_url="http://${MEGATRON_IP}:5000/generate_until"
+
+echo "[$(date)] << START GENERATION SETUP >>" |& tee -a ${LOG_FILE}
+echo "BENCH_TYPES=${BENCH_TYPES[@]}" |& tee -a ${LOG_FILE}
+echo "MODEL_PREFIX=${MODEL_PREFIX}" |& tee -a ${LOG_FILE}
+echo "BATCH_SIZE=${BATCH_SIZE}" |& tee -a ${LOG_FILE}
+echo "DO_COT=${DO_COT}" |& tee -a ${LOG_FILE}
+echo "MAX_NEW_TOKENS=${MAX_NEW_TOKENS}" |& tee -a ${LOG_FILE}
+echo "GREEDY=${GREEDY}" |& tee -a ${LOG_FILE}
+echo "N_SAMPLES=${N_SAMPLES}" |& tee -a ${LOG_FILE}
+echo "TEMPERATURE=${TEMPERATURE}" |& tee -a ${LOG_FILE}
+echo "<< END GENERATION SETUP >>" |& tee -a ${LOG_FILE}
+echo -e "\n\n" |& tee -a ${LOG_FILE}
+
+DATETIME=$(date +"%Y-%m-%d_%H-%M-%S")
+OUTPUT_PATH="${OUTPUT_PATH}/bs_${BATCH_SIZE}/${DATETIME}"
+echo "[$(date)] Starting generation.." |& tee -a ${LOG_FILE}
+declare -A target_paths
+cd megatron
+for BENCH_TYPE in "${BENCH_TYPES[@]}"; do
+  echo "---------------------------------------------" |& tee -a ${LOG_FILE}
+  echo "[$(date)] bench_type: ${BENCH_TYPE}" |& tee -a ${LOG_FILE}
+  python -u megatron_run.py \
+        --root ${OUTPUT_PATH} \
+        --model ${MODEL_PREFIX} \
+        --mode ${BENCH_TYPE} \
+        --bs ${BATCH_SIZE} \
+        --cot ${DO_COT} \
+        --max_tokens ${MAX_NEW_TOKENS} \
+        --temperature ${TEMPERATURE} \
+        --n_samples ${N_SAMPLES} \
+        --base_url ${base_url} |& tee -a ${LOG_FILE}
+  target_path=$(tail -n 1 "${LOG_FILE}")
+  echo "Results output to: ${target_path}" |& tee -a ${LOG_FILE}
+  key="${BENCH_TYPE}"
+  target_paths["${key}"]="${target_path}"
+  echo "---------------------------------------------" |& tee -a ${LOG_FILE}
+done
+cd ..
+
+
+# --------------------------- Run the evaluation ---------------------------
+echo -e "\n\n" |& tee -a ${LOG_FILE}
+echo "Shutting down the inference server..." |& tee -a ${LOG_FILE}
+kill ${INFER_PID}
+
+echo "[$(date)] Starting evaluation.." |& tee -a ${LOG_FILE}
+if (( ${#target_paths[@]} > 2 )); then
+    echo "Warning! More than 2 files to evaluate at once. Some have to wait since --ntasks-per-node=2" |& tee -a ${LOG_FILE}
+fi
+pids=()
+for key in "${!target_paths[@]}"; do
+  target_path="${target_paths[$key]}"
+  output_path=$(dirname "${target_path}")
+  BENCH_TYPE=${key}
+  echo "---------------------------------------------" |& tee -a ${LOG_FILE}
+  echo "Evaluation file: ${target_path}" |& tee -a ${LOG_FILE}
+  echo "Evaluating for bench_type: ${BENCH_TYPE}" |& tee -a ${LOG_FILE}
+
+  # Build the evaluation command.
+  cd evaluation
+  python evaluate_generations.py \
+      --generations_path ${target_path} \
+      --scored_results_path "${output_path}/generations_scored.json" \
+      --mode ${BENCH_TYPE} |& tee -a ${LOG_FILE}
+
+  echo "---------------------------------------------" |& tee -a ${LOG_FILE}
+done
+
+echo "[$(date)] Evaluation completed for all setups." |& tee -a ${LOG_FILE}
